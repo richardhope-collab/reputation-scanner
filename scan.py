@@ -105,27 +105,31 @@ def format_email_body(data):
 
     for co in data["top_10"]:
         icon = SEVERITY_ICONS.get(co.get("severity_label", ""), "")
-        lines.append(f"{co['rank']}. {co['company'].upper()}")
-        lines.append(f"   {icon} {co.get('severity_label', 'N/A')} | Score: {co['severity_score']}/10 | Velocity: {co['coverage_velocity']}")
+        lines.append(f"{co['rank']}. {co.get('company', 'Unknown').upper()}")
+        lines.append(f"   {icon} {co.get('severity_label', 'N/A')} | Score: {co.get('severity_score', 'N/A')}/10 | Velocity: {co.get('coverage_velocity', 'N/A')}")
         lines.append("")
-        lines.append("   KEY STORIES:")
-        for s in co["key_stories"]:
-            lines.append(f"   * {s['headline']} ({s['source']})")
-            lines.append(f"     {s['summary']}")
+        stories = co.get("key_stories", [])
+        if stories:
+            lines.append("   KEY STORIES:")
+            for s in stories:
+                lines.append(f"   * {s.get('headline', 'N/A')} ({s.get('source', 'N/A')})")
+                lines.append(f"     {s.get('summary', '')}")
         lines.append("")
         lines.append("   SITUATION SUMMARY:")
-        lines.append(f"   {co['risk_summary']}")
+        lines.append(f"   {co.get('risk_summary', 'N/A')}")
         lines.append("")
-        lines.append(f"   --- FULL EMAIL TO {co['outreach_email']['to_role'].upper()} ---")
-        lines.append(f"   Subject: {co['outreach_email']['subject']}")
+        email = co.get("outreach_email", {})
+        lines.append(f"   --- FULL EMAIL TO {email.get('to_role', 'HEAD OF COMMS').upper()} ---")
+        lines.append(f"   Subject: {email.get('subject', 'N/A')}")
         lines.append("")
-        for line in co["outreach_email"]["body"].split("\n"):
+        for line in email.get("body", "").split("\n"):
             lines.append(f"   {line}")
         lines.append("")
+        mobile = co.get("mobile_email", {})
         lines.append("   --- MOBILE EMAIL ---")
-        lines.append(f"   Subject: {co['mobile_email']['subject']}")
+        lines.append(f"   Subject: {mobile.get('subject', 'N/A')}")
         lines.append("")
-        for line in co["mobile_email"]["body"].split("\n"):
+        for line in mobile.get("body", "").split("\n"):
             lines.append(f"   {line}")
         lines.append("")
         lines.append("-" * 62)
