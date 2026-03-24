@@ -1,11 +1,13 @@
 import os
 import json
 import re
+import time
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-import anthropic
+import urllib.request
+import urllib.error
 
 COMPANIES = [
     "Ameriprise Financial / Columbia Threadneedle Investments",
@@ -32,56 +34,6 @@ Threat Severity Scale (apply to each account):
 - LOW (1-2): Minimal risk. Tangential coverage, opinion pieces with little reach, issues unlikely to escalate.
 """
 
-def run_scan():
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    today = datetime.now().strftime("%A, %B %d, %Y")
-
-    system_prompt = f"""You are a senior media intelligence analyst at Signal AI, an enterprise AI-powered reputation risk and media monitoring platform.
-
-Today's date: {today}
-
-Your task: search for news from the past 24 hours about the companies listed below. Identify the TOP 10 companies facing the highest velocity of negative or reputational risk coverage right now.
-
-Focus areas: regulatory enforcement actions, lawsuits and litigation, leadership scandals or departures, layoffs and restructuring, data breaches or security incidents, product failures or recalls, financial distress signals, ESG controversies, negative analyst coverage, activist investor activity, earnings misses, supply chain failures, or any story a communications team would need to respond to.
-
-{SEVERITY_GUIDE}
-
-For each company, produce TWO versions of an outreach email:
-
-FULL EMAIL: 3-4 short paragraphs. Open by referencing the specific news story. Then include a short bulleted list of 4-5 concrete Signal AI use cases directly relevant to the situation, for example real-time coverage alerts, share of voice tracking, narrative shift detection, competitor benchmarking, crisis escalation monitoring, journalist and outlet identification, sentiment trend analysis. Use commas instead of em dashes throughout. Professional and empathetic tone, not opportunistic. Close with a soft CTA for a brief call. Sign off: Rich, Enterprise Account Executive, Signal AI.
-
-MOBILE EMAIL: Maximum 6 lines total. One sentence on the news. One sentence on the reputational risk. Two bullet points on the most relevant Signal AI capabilities. One CTA line. Sign off: Rich, Signal AI. Written to be read in 30 seconds on a phone.
-
-After searching, return ONLY a valid JSON object, no markdown, no preamble, no explanation, using EXACTLY this structure:
-
-{{"scan_date":"{datetime.now().strftime('%Y-%m-%d')}","top_10":[{{"rank":1,"company":"Company Name","severity_label":"CRITICAL","severity_score":9,"coverage_velocity":"High","key_stories":[{{"headline":"Story headline","source":"Publication","summary":"One sentence summary."}}],"risk_summary":"2-3 sentences on the reputational situation and why it matters to a comms team.","outreach_email":{{"to_role":"Chief Communications Officer","subject":"Email subject line","body":"Full email body with bullet points for Signal AI use cases. No em dashes, use commas instead.\\n\\nBest,\\n\\nRich\\nEnterprise Account Executive, Signal AI"}},"mobile_email":{{"subject":"Short subject line","body":"Mobile-optimised email body, maximum 6 lines.\\n\\nRich, Signal AI"}}}}]}}
-
-Companies to scan:
-{', '.join(COMPANIES)}"""
-
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=12000,
-        tools=[{"type": "web_search_20250305", "name": "web_search"}],
-        system=system_prompt,
-        messages=[{
-            "role": "user",
-            "content": "Search for news from the past 24 hours about all listed companies. Identify the top 10 by negative coverage velocity. Apply the threat severity scale to each. Return only valid JSON as specified."
-        }]
-    )
-
-    full_text = ""
-    for block in response.content:
-        if hasattr(block, "text"):
-            full_text += block.text
-
-    match = re.search(r'\{[\s\S]*\}', full_text)
-    if not match:
-        raise ValueError("Could not parse scan results from API response.")
-
-    return json.loads(match.group(0))
-
-
 SEVERITY_ICONS = {
     "CRITICAL": "🔴",
     "HIGH":     "🟠",
@@ -89,6 +41,78 @@ SEVERITY_ICONS = {
     "MODERATE": "🔵",
     "LOW":      "⚪"
 }
+
+
+def call_gemini(prompt, max_retries=3):
+    api_key = os.environ["GEMINI_API_KEY"]
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "tools": [{"google_search": {}}],
+        "generationConfig": {"maxOutputTokens": 12000, "temperature": 0.3}
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+                candidates = result.get("candidates", [])
+                if not candidates:
+                    raise ValueError("No candidates returned from Gemini.")
+                parts = candidates[0].get("content", {}).get("parts", [])
+                return "".join(p.get("text", "") for p in parts)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8")
+            if e.code == 429 and attempt < max_retries - 1:
+                wait = 60 * (attempt + 1)
+                print(f"Rate limit hit, waiting {wait}s before retry {attempt + 2}/{max_retries}...")
+                time.sleep(wait)
+            else:
+                raise RuntimeError(f"Gemini API error {e.code}: {body}")
+
+    raise RuntimeError("All retries exhausted.")
+
+
+def run_scan():
+    today = datetime.now().strftime("%A, %B %d, %Y")
+
+    prompt = f"""You are a senior media intelligence analyst at Signal AI, an enterprise AI-powered reputation risk and media monitoring platform.
+
+Today's date: {today}
+
+Use Google Search to find news from the past 24 hours about the companies listed below. Identify the TOP 10 companies facing the highest velocity of negative or reputational risk coverage right now.
+
+Focus areas: regulatory enforcement actions, lawsuits and litigation, leadership scandals or departures, layoffs and restructuring, data breaches or security incidents, product failures or recalls, financial distress signals, ESG controversies, negative analyst coverage, activist investor activity, earnings misses, supply chain failures, or any story a communications team would need to respond to.
+
+{SEVERITY_GUIDE}
+
+For each company, produce TWO versions of an outreach email:
+
+FULL EMAIL: 3-4 short paragraphs. Open by referencing the specific news story. Include a short bulleted list of 4-5 concrete Signal AI use cases directly relevant to the situation, for example real-time coverage alerts, share of voice tracking, narrative shift detection, competitor benchmarking, crisis escalation monitoring, journalist and outlet identification, sentiment trend analysis. Use commas instead of em dashes throughout. Professional and empathetic tone, not opportunistic. Close with a soft CTA for a brief call. Sign off: Rich, Enterprise Account Executive, Signal AI.
+
+MOBILE EMAIL: Maximum 6 lines total. One sentence on the news. One sentence on the reputational risk. Two bullet points on the most relevant Signal AI capabilities. One CTA line. Sign off: Rich, Signal AI. Written to be read in 30 seconds on a phone.
+
+Return ONLY a valid JSON object, no markdown, no preamble, no explanation, using EXACTLY this structure:
+
+{{"scan_date":"{datetime.now().strftime('%Y-%m-%d')}","top_10":[{{"rank":1,"company":"Company Name","severity_label":"CRITICAL","severity_score":9,"coverage_velocity":"High","key_stories":[{{"headline":"Story headline","source":"Publication","summary":"One sentence summary."}}],"risk_summary":"2-3 sentences on the reputational situation and why it matters to a comms team.","outreach_email":{{"to_role":"Chief Communications Officer","subject":"Email subject line","body":"Full email body with bullet points for Signal AI use cases. No em dashes, use commas instead.\\n\\nBest,\\n\\nRich\\nEnterprise Account Executive, Signal AI"}},"mobile_email":{{"subject":"Short subject line","body":"Mobile-optimised email body, maximum 6 lines.\\n\\nRich, Signal AI"}}}}]}}
+
+Companies to scan:
+{', '.join(COMPANIES)}"""
+
+    raw = call_gemini(prompt)
+    match = re.search(r'\{[\s\S]*\}', raw)
+    if not match:
+        raise ValueError("Could not parse JSON from Gemini response.")
+    return json.loads(match.group(0))
 
 
 def format_email_body(data):
@@ -161,9 +185,9 @@ if __name__ == "__main__":
     data = run_scan()
     top = data["top_10"][0]
     icon = SEVERITY_ICONS.get(top.get("severity_label", ""), "")
-    print(f"Scan complete. Top account: {top['company']} {icon} {top.get('severity_label', '')}")
+    print(f"Scan complete. Top account: {top.get('company', 'Unknown')} {icon} {top.get('severity_label', '')}")
 
     body = format_email_body(data)
-    subject = f"Signal AI Scan {data['scan_date']} | {icon} {top['company']} ({top.get('severity_label', '')})"
+    subject = f"Signal AI Scan {data['scan_date']} | {icon} {top.get('company', 'Unknown')} ({top.get('severity_label', '')})"
     send_email(subject, body)
     print("Done.")
