@@ -1,13 +1,13 @@
 import os
 import json
-import re
-import time
 import smtplib
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-import urllib.request
-import urllib.error
+import anthropic
+
+# ── Accounts to monitor ──────────────────────────────────────────────────────
 
 COMPANIES = [
     "Ameriprise Financial / Columbia Threadneedle Investments",
@@ -18,176 +18,169 @@ COMPANIES = [
     "Citizens Bank", "Credit One Bank", "Edward Jones / Jones Financial",
     "Fair Isaac / FICO", "KeyBank", "Moody's Corporation",
     "Northwestern Mutual", "Progressive", "SoFi", "Apple", "Box",
-    "Cognizant", "Lam Research", "Lime", "Roblox", "Samsara",
+    "Cognizant", "Lam Research", "Roblox", "Samsara",
     "SharkNinja", "Veeva Systems", "Avantor", "Biogen", "Lululemon",
     "Paramount Global", "Ulta Beauty", "Chobani", "Performance Food Group",
     "Sazerac", "US Foods", "GlobalFoundries", "Halliburton",
     "Koch Industries", "Marathon Petroleum", "CHS", "Toast"
 ]
 
+# ── Severity guide ────────────────────────────────────────────────────────────
+
 SEVERITY_GUIDE = """
-Threat Severity Scale (apply to each account):
-- CRITICAL (9-10): Active crisis requiring immediate comms response. Breaking news, viral negative story, regulatory action with sanctions, C-suite scandal, data breach affecting customers.
-- HIGH (7-8): Significant reputational risk developing rapidly. Multiple outlets picking up a negative story, litigation filed, material financial miss with negative analyst reaction, ESG controversy gaining momentum.
-- ELEVATED (5-6): Emerging risk worth monitoring closely. Single outlet negative coverage, internal leak, minor regulatory inquiry, activist investor building a position.
-- MODERATE (3-4): Background noise. Industry-wide negative narrative that includes this company, minor criticism, low-engagement social controversy.
-- LOW (1-2): Minimal risk. Tangential coverage, opinion pieces with little reach, issues unlikely to escalate.
+Threat Severity Scale:
+- CRITICAL (9-10): Active crisis. Breaking news, viral negative story, regulatory sanctions, C-suite scandal, data breach.
+- HIGH (7-8): Significant risk developing fast. Multiple outlets, litigation filed, major financial miss, ESG controversy gaining traction.
+- ELEVATED (5-6): Emerging risk. Single outlet negative story, internal leak, minor regulatory inquiry, activist investor.
+- MODERATE (3-4): Background noise. Industry-wide narrative including this company, minor criticism, low-engagement controversy.
+- LOW (1-2): Minimal risk. Tangential coverage, opinion pieces with little reach.
 """
 
-SEVERITY_ICONS = {
-    "CRITICAL": "🔴",
-    "HIGH":     "🟠",
-    "ELEVATED": "🟡",
-    "MODERATE": "🔵",
-    "LOW":      "⚪"
-}
+# ── Claude API call ──────────────────────────────────────────────────────────
 
-
-def call_gemini(prompt, max_retries=3):
-    api_key = os.environ["GEMINI_API_KEY"]
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
-
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "tools": [{"google_search": {}}],
-        "generationConfig": {"maxOutputTokens": 12000, "temperature": 0.3}
-    }
-
-    data = json.dumps(payload).encode("utf-8")
-
-    for attempt in range(max_retries):
+def call_claude(prompt: str) -> str:
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+    for attempt in range(3):
         try:
-            req = urllib.request.Request(
-                url,
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST"
+            message = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}]
             )
-            with urllib.request.urlopen(req, timeout=180) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-                candidates = result.get("candidates", [])
-                if not candidates:
-                    raise ValueError("No candidates returned from Gemini.")
-                parts = candidates[0].get("content", {}).get("parts", [])
-                return "".join(p.get("text", "") for p in parts)
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8")
-            if e.code == 429 and attempt < max_retries - 1:
-                wait = 60 * (attempt + 1)
-                print(f"Rate limit hit, waiting {wait}s before retry {attempt + 2}/{max_retries}...")
-                time.sleep(wait)
+            return message.content[0].text
+        except anthropic.RateLimitError:
+            if attempt < 2:
+                print(f"Rate limit hit, waiting 60s (attempt {attempt + 1}/3)...")
+                time.sleep(60)
             else:
-                raise RuntimeError(f"Gemini API error {e.code}: {body}")
+                raise
 
-    raise RuntimeError("All retries exhausted.")
+# ── Build prompt ──────────────────────────────────────────────────────────────
 
+def build_prompt() -> str:
+    today = datetime.utcnow().strftime("%B %d, %Y")
+    companies_list = "\n".join(f"- {c}" for c in COMPANIES)
+    return f"""Today is {today}. You are a senior reputation risk analyst.
 
-def run_scan():
-    today = datetime.now().strftime("%A, %B %d, %Y")
-
-    prompt = f"""You are a senior media intelligence analyst at Signal AI, an enterprise AI-powered reputation risk and media monitoring platform.
-
-Today's date: {today}
-
-Use Google Search to find news from the past 24 hours about the companies listed below. Identify the TOP 10 companies facing the highest velocity of negative or reputational risk coverage right now.
-
-Focus areas: regulatory enforcement actions, lawsuits and litigation, leadership scandals or departures, layoffs and restructuring, data breaches or security incidents, product failures or recalls, financial distress signals, ESG controversies, negative analyst coverage, activist investor activity, earnings misses, supply chain failures, or any story a communications team would need to respond to.
+Search for news published in the last 24-48 hours for each company below. Identify any reputational risks, negative press, regulatory issues, controversies, or crises. If nothing significant is found for a company, mark it LOW.
 
 {SEVERITY_GUIDE}
 
-For each company, produce TWO versions of an outreach email:
-
-FULL EMAIL: 3-4 short paragraphs. Open by referencing the specific news story. Include a short bulleted list of 4-5 concrete Signal AI use cases directly relevant to the situation, for example real-time coverage alerts, share of voice tracking, narrative shift detection, competitor benchmarking, crisis escalation monitoring, journalist and outlet identification, sentiment trend analysis. Use commas instead of em dashes throughout. Professional and empathetic tone, not opportunistic. Close with a soft CTA for a brief call. Sign off: Rich, Enterprise Account Executive, Signal AI.
-
-MOBILE EMAIL: Maximum 6 lines total. One sentence on the news. One sentence on the reputational risk. Two bullet points on the most relevant Signal AI capabilities. One CTA line. Sign off: Rich, Signal AI. Written to be read in 30 seconds on a phone.
-
-Return ONLY a valid JSON object, no markdown, no preamble, no explanation, using EXACTLY this structure:
-
-{{"scan_date":"{datetime.now().strftime('%Y-%m-%d')}","top_10":[{{"rank":1,"company":"Company Name","severity_label":"CRITICAL","severity_score":9,"coverage_velocity":"High","key_stories":[{{"headline":"Story headline","source":"Publication","summary":"One sentence summary."}}],"risk_summary":"2-3 sentences on the reputational situation and why it matters to a comms team.","outreach_email":{{"to_role":"Chief Communications Officer","subject":"Email subject line","body":"Full email body with bullet points for Signal AI use cases. No em dashes, use commas instead.\\n\\nBest,\\n\\nRich\\nEnterprise Account Executive, Signal AI"}},"mobile_email":{{"subject":"Short subject line","body":"Mobile-optimised email body, maximum 6 lines.\\n\\nRich, Signal AI"}}}}]}}
-
 Companies to scan:
-{', '.join(COMPANIES)}"""
+{companies_list}
 
-    raw = call_gemini(prompt)
-    match = re.search(r'\{[\s\S]*\}', raw)
-    if not match:
-        raise ValueError("Could not parse JSON from Gemini response.")
-    return json.loads(match.group(0))
+Return ONLY a valid JSON array. No preamble, no markdown, no explanation. Each element must have exactly these fields:
+- "company": string
+- "severity": string (CRITICAL / HIGH / ELEVATED / MODERATE / LOW)
+- "score": integer 1-10
+- "headline": string (one sentence summary of the key risk, or "No significant news" if clean)
+- "detail": string (2-3 sentences of context, or empty string if clean)
+- "source": string (publication name, or "N/A")
 
+Return all {len(COMPANIES)} companies. Sort by score descending."""
 
-def format_email_body(data):
-    lines = []
-    lines.append("SIGNAL AI DAILY REPUTATION SCAN")
-    lines.append(f"Date: {data['scan_date']}")
-    lines.append("Top 10 accounts by negative coverage velocity")
-    lines.append("=" * 62)
-    lines.append("")
-    lines.append("THREAT SEVERITY SCALE")
-    lines.append("🔴 CRITICAL (9-10)  🟠 HIGH (7-8)  🟡 ELEVATED (5-6)  🔵 MODERATE (3-4)  ⚪ LOW (1-2)")
-    lines.append("=" * 62)
-    lines.append("")
+# ── Parse response ────────────────────────────────────────────────────────────
 
-    for co in data["top_10"]:
-        icon = SEVERITY_ICONS.get(co.get("severity_label", ""), "")
-        lines.append(f"{co['rank']}. {co.get('company', 'Unknown').upper()}")
-        lines.append(f"   {icon} {co.get('severity_label', 'N/A')} | Score: {co.get('severity_score', 'N/A')}/10 | Velocity: {co.get('coverage_velocity', 'N/A')}")
-        lines.append("")
-        stories = co.get("key_stories", [])
-        if stories:
-            lines.append("   KEY STORIES:")
-            for s in stories:
-                lines.append(f"   * {s.get('headline', 'N/A')} ({s.get('source', 'N/A')})")
-                lines.append(f"     {s.get('summary', '')}")
-        lines.append("")
-        lines.append("   SITUATION SUMMARY:")
-        lines.append(f"   {co.get('risk_summary', 'N/A')}")
-        lines.append("")
-        email = co.get("outreach_email", {})
-        lines.append(f"   --- FULL EMAIL TO {email.get('to_role', 'HEAD OF COMMS').upper()} ---")
-        lines.append(f"   Subject: {email.get('subject', 'N/A')}")
-        lines.append("")
-        for line in email.get("body", "").split("\n"):
-            lines.append(f"   {line}")
-        lines.append("")
-        mobile = co.get("mobile_email", {})
-        lines.append("   --- MOBILE EMAIL ---")
-        lines.append(f"   Subject: {mobile.get('subject', 'N/A')}")
-        lines.append("")
-        for line in mobile.get("body", "").split("\n"):
-            lines.append(f"   {line}")
-        lines.append("")
-        lines.append("-" * 62)
-        lines.append("")
+def parse_response(raw: str) -> list:
+    # Strip markdown fences if present
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.rsplit("```", 1)[0]
+    return json.loads(text.strip())
 
-    lines.append("Generated by Signal AI Daily Reputation Scanner")
-    return "\n".join(lines)
+# ── Format email ──────────────────────────────────────────────────────────────
 
+SEVERITY_EMOJI = {
+    "CRITICAL": "🔴",
+    "HIGH": "🟠",
+    "ELEVATED": "🟡",
+    "MODERATE": "🔵",
+    "LOW": "🟢",
+}
 
-def send_email(subject, body):
+def format_email(results: list, scan_date: str) -> tuple[str, str]:
+    # Subject line based on top result
+    top = results[0] if results else {}
+    top_severity = top.get("severity", "LOW")
+    top_company = top.get("company", "N/A")
+    icon = SEVERITY_EMOJI.get(top_severity, "")
+    subject = f"Reputation Scan {scan_date} | {icon} {top_company} ({top_severity})"
+
+    # Group by severity
+    groups = {}
+    for r in results:
+        sev = r.get("severity", "LOW")
+        groups.setdefault(sev, []).append(r)
+
+    lines = [
+        f"SIGNAL AI REPUTATION SCAN",
+        f"Generated: {scan_date} UTC",
+        f"Accounts monitored: {len(results)}",
+        "=" * 60,
+        "",
+    ]
+
+    order = ["CRITICAL", "HIGH", "ELEVATED", "MODERATE", "LOW"]
+    for sev in order:
+        items = groups.get(sev, [])
+        if not items:
+            continue
+        emoji = SEVERITY_EMOJI.get(sev, "")
+        lines.append(f"{emoji} {sev} ({len(items)})")
+        lines.append("-" * 40)
+        for r in items:
+            lines.append(f"  {r.get('company', '')}  [Score: {r.get('score', '')}]")
+            lines.append(f"  {r.get('headline', '')}")
+            if r.get("detail"):
+                lines.append(f"  {r.get('detail', '')}")
+            if r.get("source") and r.get("source") != "N/A":
+                lines.append(f"  Source: {r.get('source', '')}")
+            lines.append("")
+
+    body = "\n".join(lines)
+    return subject, body
+
+# ── Send email ────────────────────────────────────────────────────────────────
+
+def send_email(subject: str, body: str):
     to_email = os.environ["TO_EMAIL"]
     from_email = os.environ["FROM_EMAIL"]
-    app_password = os.environ["GMAIL_APP_PASSWORD"]
+    password = os.environ["GMAIL_APP_PASSWORD"]
 
-    msg = MIMEMultipart()
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
     msg["From"] = from_email
     msg["To"] = to_email
-    msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(from_email, app_password)
-        server.send_message(msg)
+        server.login(from_email, password)
+        server.sendmail(from_email, to_email, msg.as_string())
+
     print(f"Email sent to {to_email}")
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    print(f"Starting reputation scan, {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}")
-    data = run_scan()
-    top = data["top_10"][0]
-    icon = SEVERITY_ICONS.get(top.get("severity_label", ""), "")
-    print(f"Scan complete. Top account: {top.get('company', 'Unknown')} {icon} {top.get('severity_label', '')}")
+def main():
+    scan_date = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    print(f"Starting reputation scan, {scan_date} UTC")
 
-    body = format_email_body(data)
-    subject = f"Signal AI Scan {data['scan_date']} | {icon} {top.get('company', 'Unknown')} ({top.get('severity_label', '')})"
+    prompt = build_prompt()
+    print("Calling Claude API...")
+    raw = call_claude(prompt)
+    print("Response received, parsing...")
+
+    results = parse_response(raw)
+    print(f"Parsed {len(results)} company records")
+
+    subject, body = format_email(results, scan_date)
+    print(f"Subject: {subject}")
+
     send_email(subject, body)
     print("Done.")
+
+if __name__ == "__main__":
+    main()
