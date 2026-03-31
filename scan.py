@@ -44,7 +44,7 @@ def call_claude(prompt: str) -> str:
         try:
             message = client.messages.create(
                 model="claude-opus-4-5",
-                max_tokens=4096,
+                max_tokens=16000,
                 messages=[{"role": "user", "content": prompt}]
             )
             return message.content[0].text
