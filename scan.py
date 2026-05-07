@@ -36,6 +36,16 @@ Threat Severity Scale:
 - LOW (1-2): Minimal risk. Tangential coverage, opinion pieces with little reach.
 """
 
+# ── Signal AI USPs for email drafting ────────────────────────────────────────
+
+SIGNAL_AI_USPS = """
+- Reputation Intelligence: tracks narrative shifts in real time across 4M+ sources so comms teams get ahead of coverage before it becomes a crisis.
+- Risk Intelligence: surfaces emerging threats by entity, topic, and geography, giving teams an early warning system that PR monitoring tools miss.
+- Memo: auto-generates executive-ready briefings from daily coverage, cutting hours of manual curation for comms teams.
+- Competitive Intelligence: benchmarks share of voice and sentiment against competitors across global media, giving comms leaders the data to justify strategy.
+- AI Citations: delivers sourced, verified intelligence so teams can act on AI-generated insights without the hallucination risk.
+"""
+
 # ── Claude API call ──────────────────────────────────────────────────────────
 
 def call_claude(prompt: str) -> str:
@@ -55,7 +65,7 @@ def call_claude(prompt: str) -> str:
             else:
                 raise
 
-# ── Build prompt ──────────────────────────────────────────────────────────────
+# ── Build scan prompt ─────────────────────────────────────────────────────────
 
 def build_prompt() -> str:
     today = datetime.utcnow().strftime("%B %d, %Y")
@@ -79,10 +89,46 @@ Return ONLY a valid JSON array. No preamble, no markdown, no explanation. Each e
 
 Return all {len(COMPANIES)} companies. Sort by score descending."""
 
+# ── Build outreach drafting prompt ────────────────────────────────────────────
+
+def build_drafts_prompt(top10: list) -> str:
+    accounts_block = ""
+    for r in top10:
+        accounts_block += f"""
+Company: {r['company']}
+Severity: {r['severity']}
+Headline: {r['headline']}
+Detail: {r.get('detail', '')}
+Source: {r.get('source', 'N/A')}
+---"""
+
+    return f"""You are Rich Hope, Enterprise Account Executive at Signal AI.
+
+Signal AI is an AI-powered media intelligence platform. Its key capabilities are:
+{SIGNAL_AI_USPS}
+
+Below are 10 companies that appeared in today's reputation scan, with the news context that triggered the alert. For each company, draft a short cold outreach email to their Head of Communications.
+
+Rules for every draft:
+- Open with the specific news insight from today, not a generic opener.
+- One sentence connecting their situation to the single most relevant Signal AI capability.
+- Soft CTA for a 20-minute call to discuss how Signal AI can help.
+- Max 100 words total.
+- No em dashes. No "I hope this finds you well." No corporate filler. No pricing.
+- Peer-level tone throughout.
+- Sign off: Rich Hope, Enterprise Account Executive, Signal AI.
+
+Accounts:
+{accounts_block}
+
+Return ONLY a valid JSON array. No preamble, no markdown. Each element must have exactly these fields:
+- "company": string (match exactly to the company name above)
+- "subject": string (max 8 words, news-anchored, no clickbait)
+- "draft": string (the full email body)"""
+
 # ── Parse response ────────────────────────────────────────────────────────────
 
 def parse_response(raw: str) -> list:
-    # Strip markdown fences if present
     text = raw.strip()
     if text.startswith("```"):
         text = text.split("```", 2)[1]
@@ -90,6 +136,16 @@ def parse_response(raw: str) -> list:
             text = text[4:]
         text = text.rsplit("```", 1)[0]
     return json.loads(text.strip())
+
+# ── Generate outreach drafts ──────────────────────────────────────────────────
+
+def generate_outreach_drafts(top10: list) -> dict:
+    """Returns a dict of company name -> {subject, draft}."""
+    print("Generating outreach drafts for top 10...")
+    prompt = build_drafts_prompt(top10)
+    raw = call_claude(prompt)
+    drafts_list = parse_response(raw)
+    return {d["company"]: d for d in drafts_list}
 
 # ── Format email ──────────────────────────────────────────────────────────────
 
@@ -101,15 +157,16 @@ SEVERITY_EMOJI = {
     "LOW": "🟢",
 }
 
-def format_email(results: list, scan_date: str) -> tuple[str, str]:
-    # Subject line based on top result
+def format_email(results: list, drafts: dict, scan_date: str) -> tuple[str, str]:
     top = results[0] if results else {}
     top_severity = top.get("severity", "LOW")
     top_company = top.get("company", "N/A")
     icon = SEVERITY_EMOJI.get(top_severity, "")
     subject = f"Reputation Scan {scan_date} | {icon} {top_company} ({top_severity})"
 
-    # Group by severity
+    # Track which companies have a draft
+    draft_companies = set(drafts.keys())
+
     groups = {}
     for r in results:
         sev = r.get("severity", "LOW")
@@ -132,12 +189,27 @@ def format_email(results: list, scan_date: str) -> tuple[str, str]:
         lines.append(f"{emoji} {sev} ({len(items)})")
         lines.append("-" * 40)
         for r in items:
-            lines.append(f"  {r.get('company', '')}  [Score: {r.get('score', '')}]")
+            company = r.get("company", "")
+            lines.append(f"  {company}  [Score: {r.get('score', '')}]")
             lines.append(f"  {r.get('headline', '')}")
             if r.get("detail"):
                 lines.append(f"  {r.get('detail', '')}")
             if r.get("source") and r.get("source") != "N/A":
                 lines.append(f"  Source: {r.get('source', '')}")
+
+            # Inject outreach draft if this company is in the top 10
+            if company in draft_companies:
+                d = drafts[company]
+                lines.append("")
+                lines.append("  DRAFT OUTREACH")
+                lines.append("  " + "." * 36)
+                lines.append(f"  Subject: {d.get('subject', '')}")
+                lines.append("")
+                # Indent each line of the draft body
+                for draft_line in d.get("draft", "").splitlines():
+                    lines.append(f"  {draft_line}")
+                lines.append("  " + "." * 36)
+
             lines.append("")
 
     body = "\n".join(lines)
@@ -169,14 +241,19 @@ def main():
     print(f"Starting reputation scan, {scan_date} UTC")
 
     prompt = build_prompt()
-    print("Calling Claude API...")
+    print("Calling Claude API for reputation scan...")
     raw = call_claude(prompt)
     print("Response received, parsing...")
 
     results = parse_response(raw)
     print(f"Parsed {len(results)} company records")
 
-    subject, body = format_email(results, scan_date)
+    # Top 10 by score for outreach drafts
+    top10 = sorted(results, key=lambda x: x.get("score", 0), reverse=True)[:10]
+    drafts = generate_outreach_drafts(top10)
+    print(f"Drafts generated for {len(drafts)} accounts")
+
+    subject, body = format_email(results, drafts, scan_date)
     print(f"Subject: {subject}")
 
     send_email(subject, body)
